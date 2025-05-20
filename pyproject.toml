@@ -1,0 +1,24 @@
+[tool.poetry]
+name = "machine-learning-mini-project"
+version = "0.1.0"
+description = ""
+authors = ["Pedro Henrique Azevedo Vanderlei de Mendonca <phavm@cin.ufpe.br>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.12"
+numpy = "2.2.6"
+scikit-learn = "^1.6.1"
+wandb = "^0.19.11"
+sklearn-lvq = "^1.1.1"
+joblib = "^1.5.0"
+scikit-posthocs = "^0.11.4"
+matplotlib = "^3.10.3"
+pandas = "^2.2.3"
+plotly = "^6.1.0"
+ucimlrepo = "^0.0.7"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
