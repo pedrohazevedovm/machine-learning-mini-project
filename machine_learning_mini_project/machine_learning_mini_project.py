@@ -6,7 +6,7 @@ import math
 from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.utils import shuffle
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedKFold, GridSearchCV
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
 )
@@ -73,53 +73,38 @@ class CustomLVQ(BaseEstimator, ClassifierMixin):
         return self.prototype_labels_[winners]
 
 
-# === 2. GRID-SEARCH 5-FOLD PARA AJUSTE DO LVQ ===
-def tune_custom_lvq(X, y, n_splits=5, n_jobs=-1):
-    param_grid = {
-        "n_prototypes_per_class": [2, 4, 5, 10, 15, 20, 25],
-        "learning_rate": [0.001, 0.01, 0.02, 0.05, 0.1],
-        "n_epochs": [500, 1000, 1500, 2000]
+# === 2. PARÂMETROS PARA GRID-SEARCH ===
+param_grids = {
+    "Decision Tree": {
+        "max_depth": [None, 10, 20, 30],
+        "min_samples_split": [2, 5, 10]
+    },
+    "Random Forest": {
+        "n_estimators": [50, 100, 200],
+        "max_depth": [None, 10, 20],
+        "min_samples_split": [2, 5]
+    },
+    "SVM": {
+        "C": [0.1, 1, 10],
+        "kernel": ["linear", "rbf"]
+    },
+    "MLP": {
+        "hidden_layer_sizes": [(10,), (50,)],
+        "alpha": [0.0001, 0.001],
+        "max_iter": [500, 1000]
+    },
+    "KNN": {
+        "n_neighbors": [3, 5, 7],
+        "weights": ["uniform", "distance"]
+    },
+    "LVQ": {
+        "n_prototypes_per_class": [2, 5, 10],
+        "learning_rate": [0.001, 0.01, 0.1],
+        "n_epochs": [500, 1000]
     }
-    kf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
-
-    def eval_params(params):
-        clf = CustomLVQ(**params)
-        scores = []
-        for ti, vi in kf.split(X, y):
-            clf.fit(X[ti], y[ti])
-            yp = clf.predict(X[vi])
-            scores.append(f1_score(y[vi], yp, zero_division=0))
-        return np.mean(scores), params
-
-    combos = [
-        {"n_prototypes_per_class": p, "learning_rate": lr, "n_epochs": ep}
-        for p in param_grid["n_prototypes_per_class"]
-        for lr in param_grid["learning_rate"]
-        for ep in param_grid["n_epochs"]
-    ]
-
-    results = Parallel(n_jobs=n_jobs)(
-        delayed(eval_params)(params) for params in combos
-    )
-
-    best_score, best_params = max(results, key=lambda x: x[0])
-    print("LVQ best params:", best_params, "F1:", best_score)
-    return CustomLVQ(**best_params).fit(X, y)
-
-
-# === 3. CONFIGURAÇÃO DOS MODELOS ===
-models = {
-    "Decision Tree": DecisionTreeClassifier(),
-    "Random Forest": RandomForestClassifier(),
-    "SVM": SVC(probability=True),
-    "MLP": MLPClassifier(hidden_layer_sizes=(10,), max_iter=1000),
-    "KNN": KNeighborsClassifier(),
-    "LVQ": None  # será definido após o tuning
 }
-model_names = list(models.keys())
 
-
-# === 4. MÉTRICAS E FUNÇÕES AUXILIARES ===
+# === 3. MÉTRICAS E FUNÇÕES AUXILIARES ===
 metrics = {
     "accuracy": accuracy_score,
     "precision": precision_score,
@@ -151,7 +136,8 @@ def evaluate_fold(train_idx, test_idx, models, X, y, metric, name):
         scores.append(s)
     return scores
 
-def run_pipeline(X, y, project_name="ml-comparisons", n_splits=10, n_jobs=-1):
+def run_pipeline(X, y, models, project_name="ml-comparisons", n_splits=10, n_jobs=-1):
+    model_names = list(models.keys())
     kf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
 
     for name, metric in metrics.items():
@@ -161,19 +147,19 @@ def run_pipeline(X, y, project_name="ml-comparisons", n_splits=10, n_jobs=-1):
             delayed(evaluate_fold)(ti, vi, models, X, y, metric, name)
             for ti, vi in kf.split(X, y)
         )
-        F = np.array(folds)  # shape=(folds, models)
+        F = np.array(folds)
         ranks = np.array([rankdata(-f, method="average") for f in F])
         avg_ranks = np.mean(ranks, axis=0)
 
         stat, p = friedmanchisquare(*[F[:,i] for i in range(F.shape[1])])
         wandb.log({f"{name}/friedman_stat": stat, f"{name}/p_value": p})
 
-        table = []
+        summary = []
         for i, m in enumerate(model_names):
             mu, sd = F[:,i].mean(), F[:,i].std()
             wandb.log({f"{m}/{name}_mean": mu, f"{m}/{name}_std": sd})
-            table.append([m, mu, sd])
-        wandb.log({f"{name}/summary": wandb.Table(data=table, columns=["Model","Mean","Std"])})
+            summary.append([m, mu, sd])
+        wandb.log({f"{name}/summary": wandb.Table(data=summary, columns=["Model","Mean","Std"])})
 
         if p < 0.05:
             post = sp.posthoc_nemenyi_friedman(F)
@@ -191,20 +177,34 @@ def run_pipeline(X, y, project_name="ml-comparisons", n_splits=10, n_jobs=-1):
         wandb.finish()
 
 
-# === 5. MAIN ===
+# === 4. MAIN ===
 if __name__ == "__main__":
     with open(r"machine_learning_mini_project\adult_income.pkl", "rb") as f:
-        data = pickle.load(f)
-    X_train, y_train, X_test, y_test = data
-
+        X_train, y_train, X_test, y_test = pickle.load(f)
     X = np.vstack((X_train, X_test))
     y = np.concatenate((y_train, y_test))
-    print("Dataset completo:", X.shape, y.shape)
 
-    scaler = StandardScaler()
-    X = scaler.fit_transform(X)
+    base_models = {
+        "Decision Tree": DecisionTreeClassifier(),
+        "Random Forest": RandomForestClassifier(),
+        "SVM": SVC(probability=True),
+        "MLP": MLPClassifier(),
+        "KNN": KNeighborsClassifier(),
+        "LVQ": CustomLVQ()
+    }
 
-    best_lvq = tune_custom_lvq(X, y, n_splits=5, n_jobs=-1)
-    models["LVQ"] = best_lvq
+    best_models = {}
+    for name, model in base_models.items():
+        print(f"Tuning {name}...")
+        grid = GridSearchCV(
+            estimator=model,
+            param_grid=param_grids[name],
+            scoring="f1",
+            cv=StratifiedKFold(n_splits=5, shuffle=True, random_state=42),
+            n_jobs=-1
+        )
+        grid.fit(X, y)
+        print(f"→ {name} best_params: {grid.best_params_} (f1={grid.best_score_:.4f})")
+        best_models[name] = grid.best_estimator_
 
-    run_pipeline(X, y, project_name="ml-comparisons", n_splits=10, n_jobs=-1)
+    run_pipeline(X, y, best_models, project_name="ml-comparisons", n_splits=10, n_jobs=-1)
