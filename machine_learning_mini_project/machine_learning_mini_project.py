@@ -1,34 +1,125 @@
+import pickle
 import numpy as np
 import wandb
-import tempfile
-import os
 import math
 
+from sklearn.base import BaseEstimator, ClassifierMixin
+from sklearn.utils import shuffle
+from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import StratifiedKFold
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+)
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.svm import SVC
 from sklearn.neural_network import MLPClassifier
 from sklearn.neighbors import KNeighborsClassifier
-from sklearn_lvq import GlvqModel
 
 from scipy.stats import friedmanchisquare, rankdata
 import scikit_posthocs as sp
 from joblib import Parallel, delayed
 
-# === MODELOS ===
+# === 1. IMPLEMENTAÇÃO CUSTOM LVQ ===
+class CustomLVQ(BaseEstimator, ClassifierMixin):
+    def __init__(
+        self,
+        n_prototypes_per_class=5,
+        learning_rate=0.01,
+        n_epochs=1000,
+        batch_size=32,
+        random_state=42
+    ):
+        self.n_prototypes_per_class = n_prototypes_per_class
+        self.learning_rate = learning_rate
+        self.n_epochs = n_epochs
+        self.batch_size = batch_size
+        self.random_state = random_state
+
+    def _initialize_prototypes(self, X, y):
+        np.random.seed(self.random_state)
+        classes = np.unique(y)
+        protos, labels = [], []
+        for cls in classes:
+            Xc = X[y == cls]
+            idx = np.random.choice(len(Xc), self.n_prototypes_per_class, replace=True)
+            protos.append(Xc[idx])
+            labels += [cls] * self.n_prototypes_per_class
+        self.prototypes_ = np.vstack(protos)
+        self.prototype_labels_ = np.array(labels)
+
+    def fit(self, X, y):
+        self._initialize_prototypes(X, y)
+        for epoch in range(self.n_epochs):
+            Xb, yb = shuffle(X, y, random_state=self.random_state + epoch)
+            for i in range(0, len(Xb), self.batch_size):
+                xb, ybi = Xb[i:i+self.batch_size], yb[i:i+self.batch_size]
+                self._update_batch(xb, ybi)
+        return self
+
+    def _update_batch(self, X, y):
+        for x_i, y_i in zip(X, y):
+            dists = np.linalg.norm(self.prototypes_ - x_i, axis=1)
+            w = np.argmin(dists)
+            direction = 1 if self.prototype_labels_[w] == y_i else -1
+            self.prototypes_[w] += direction * self.learning_rate * (x_i - self.prototypes_[w])
+
+    def predict(self, X):
+        d = np.linalg.norm(
+            self.prototypes_[np.newaxis,:,:] - X[:,np.newaxis,:],
+            axis=2
+        )
+        winners = np.argmin(d, axis=1)
+        return self.prototype_labels_[winners]
+
+
+# === 2. GRID-SEARCH 5-FOLD PARA AJUSTE DO LVQ ===
+def tune_custom_lvq(X, y, n_splits=5, n_jobs=-1):
+    param_grid = {
+        "n_prototypes_per_class": [2, 4, 5, 10, 15, 20, 25],
+        "learning_rate": [0.001, 0.01, 0.02, 0.05, 0.1],
+        "n_epochs": [500, 1000, 1500, 2000]
+    }
+    kf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+
+    def eval_params(params):
+        clf = CustomLVQ(**params)
+        scores = []
+        for ti, vi in kf.split(X, y):
+            clf.fit(X[ti], y[ti])
+            yp = clf.predict(X[vi])
+            scores.append(f1_score(y[vi], yp, zero_division=0))
+        return np.mean(scores), params
+
+    combos = [
+        {"n_prototypes_per_class": p, "learning_rate": lr, "n_epochs": ep}
+        for p in param_grid["n_prototypes_per_class"]
+        for lr in param_grid["learning_rate"]
+        for ep in param_grid["n_epochs"]
+    ]
+
+    results = Parallel(n_jobs=n_jobs)(
+        delayed(eval_params)(params) for params in combos
+    )
+
+    best_score, best_params = max(results, key=lambda x: x[0])
+    print("LVQ best params:", best_params, "F1:", best_score)
+    return CustomLVQ(**best_params).fit(X, y)
+
+
+# === 3. CONFIGURAÇÃO DOS MODELOS ===
 models = {
     "Decision Tree": DecisionTreeClassifier(),
     "Random Forest": RandomForestClassifier(),
     "SVM": SVC(probability=True),
     "MLP": MLPClassifier(hidden_layer_sizes=(10,), max_iter=1000),
     "KNN": KNeighborsClassifier(),
-    "LVQ": GlvqModel()
+    "LVQ": None  # será definido após o tuning
 }
 model_names = list(models.keys())
 
-# === MÉTRICAS ===
+
+# === 4. MÉTRICAS E FUNÇÕES AUXILIARES ===
 metrics = {
     "accuracy": accuracy_score,
     "precision": precision_score,
@@ -37,92 +128,83 @@ metrics = {
     "roc_auc": roc_auc_score
 }
 
-
-# === FUNÇÃO DE DIFERENÇA CRÍTICA ===
 def compute_cd(k, N, alpha=0.05):
-    q_alpha_table = {
-        2: 1.960, 3: 2.343, 4: 2.569, 5: 2.728,
-        6: 2.850, 7: 2.949, 8: 3.031, 9: 3.102, 10: 3.164
-    }
-    if k not in q_alpha_table:
-        raise ValueError(f"q_alpha não definido para {k} algoritmos.")
-    q_alpha = q_alpha_table[k]
-    return q_alpha * math.sqrt((k * (k + 1)) / (6.0 * N))
+    q = {2:1.960,3:2.343,4:2.569,5:2.728,6:2.850,7:2.949,8:3.031,9:3.102,10:3.164}
+    if k not in q:
+        raise ValueError(f"q_alpha não definido para {k}")
+    return q[k] * math.sqrt((k*(k+1)) / (6.0 * N))
 
+def evaluate_fold(train_idx, test_idx, models, X, y, metric, name):
+    scores = []
+    for m in models:
+        clf = models[m]
+        clf.fit(X[train_idx], y[train_idx])
+        yp = clf.predict(X[test_idx])
+        proba = clf.predict_proba(X[test_idx])[:,1] if hasattr(clf, "predict_proba") else None
 
-# === FUNÇÃO DE AVALIAÇÃO DE UMA FOLD ===
-def evaluate_fold(train_idx, test_idx, models, X, y, metric_func, metric_name):
-    fold_scores = []
-    for name in models:
-        model = models[name]
-        model.fit(X[train_idx], y[train_idx])
-        y_pred = model.predict(X[test_idx])
-        y_proba = model.predict_proba(X[test_idx])[:, 1] if hasattr(model, "predict_proba") else None
-
-        if metric_name == "roc_auc" and y_proba is not None:
-            score = metric_func(y[test_idx], y_proba)
+        if name == "roc_auc" and proba is not None:
+            s = metric(y[test_idx], proba)
+        elif name in ["precision","recall","f1"]:
+            s = metric(y[test_idx], yp, zero_division=0)
         else:
-            if metric_name in ["precision", "recall", "f1"]:
-                score = metric_func(y[test_idx], y_pred, zero_division=0)
-            else:
-                score = metric_func(y[test_idx], y_pred)
+            s = metric(y[test_idx], yp)
+        scores.append(s)
+    return scores
 
-        fold_scores.append(score)
-    return fold_scores
-
-
-# === PIPELINE PRINCIPAL POR MÉTRICA ===
 def run_pipeline(X, y, project_name="ml-comparisons", n_splits=10, n_jobs=-1):
     kf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
 
-    for metric_name, metric_func in metrics.items():
-        wandb.init(project=project_name, name=f"CD-{metric_name}", reinit=True)
+    for name, metric in metrics.items():
+        wandb.init(project=project_name, name=f"CD-{name}", reinit=True)
 
-        # Avaliação paralela das folds
-        scores_per_fold = Parallel(n_jobs=n_jobs)(
-            delayed(evaluate_fold)(train_idx, test_idx, models, X, y, metric_func, metric_name)
-            for train_idx, test_idx in kf.split(X, y)
+        folds = Parallel(n_jobs=n_jobs)(
+            delayed(evaluate_fold)(ti, vi, models, X, y, metric, name)
+            for ti, vi in kf.split(X, y)
         )
-        scores_per_fold = np.array(scores_per_fold)  # shape: (folds, models)
-        rankings = np.array([rankdata(-row, method='average') for row in scores_per_fold])
-        avg_ranks = np.mean(rankings, axis=0)
+        F = np.array(folds)  # shape=(folds, models)
+        ranks = np.array([rankdata(-f, method="average") for f in F])
+        avg_ranks = np.mean(ranks, axis=0)
 
-        # Friedman
-        stat, p = friedmanchisquare(*[scores_per_fold[:, i] for i in range(scores_per_fold.shape[1])])
-        wandb.log({f"{metric_name}/friedman_statistic": stat, f"{metric_name}/p_value": p})
+        stat, p = friedmanchisquare(*[F[:,i] for i in range(F.shape[1])])
+        wandb.log({f"{name}/friedman_stat": stat, f"{name}/p_value": p})
 
-        # Média e desvio
-        summary_data = []
-        for i, name in enumerate(model_names):
-            scores = scores_per_fold[:, i]
-            mean = np.mean(scores)
-            std = np.std(scores)
-            wandb.log({
-                f"{name}/{metric_name}_mean": mean,
-                f"{name}/{metric_name}_std": std
-            })
-            summary_data.append([name, mean, std])
+        table = []
+        for i, m in enumerate(model_names):
+            mu, sd = F[:,i].mean(), F[:,i].std()
+            wandb.log({f"{m}/{name}_mean": mu, f"{m}/{name}_std": sd})
+            table.append([m, mu, sd])
+        wandb.log({f"{name}/summary": wandb.Table(data=table, columns=["Model","Mean","Std"])})
 
-        wandb.log({
-            f"{metric_name}/summary_table": wandb.Table(data=summary_data, columns=["Model", "Mean", "Std"])
-        })
-
-        # Se Friedman significativo → Nemenyi + CD Diagram
         if p < 0.05:
-            nemenyi = sp.posthoc_nemenyi_friedman(scores_per_fold)
-            nemenyi.columns = model_names
-            nemenyi.index = model_names
-            wandb.log({
-                f"{metric_name}/nemenyi_pvalues": wandb.Table(data=nemenyi.values.tolist(), columns=model_names)
-            })
-
+            post = sp.posthoc_nemenyi_friedman(F)
+            post.columns = post.index = model_names
+            wandb.log({f"{name}/nemenyi": wandb.Table(data=post.values.tolist(), columns=model_names)})
             cd = compute_cd(len(models), n_splits)
-            wandb.log({f"{metric_name}/CD": cd})
-
-            # Logar rankings médios em uma tabela
-            rank_table = [[model_names[i], float(avg_ranks[i])] for i in range(len(model_names))]
+            wandb.log({f"{name}/CD": cd})
             wandb.log({
-                f"{metric_name}/avg_ranks": wandb.Table(data=rank_table, columns=["Model", "Average Rank"])
+                f"{name}/avg_ranks": wandb.Table(
+                    data=[[model_names[i], float(avg_ranks[i])] for i in range(len(models))],
+                    columns=["Model","AvgRank"]
+                )
             })
 
         wandb.finish()
+
+
+# === 5. MAIN ===
+if __name__ == "__main__":
+    with open(r"machine_learning_mini_project\adult_income.pkl", "rb") as f:
+        data = pickle.load(f)
+    X_train, y_train, X_test, y_test = data
+
+    X = np.vstack((X_train, X_test))
+    y = np.concatenate((y_train, y_test))
+    print("Dataset completo:", X.shape, y.shape)
+
+    scaler = StandardScaler()
+    X = scaler.fit_transform(X)
+
+    best_lvq = tune_custom_lvq(X, y, n_splits=5, n_jobs=-1)
+    models["LVQ"] = best_lvq
+
+    run_pipeline(X, y, project_name="ml-comparisons", n_splits=10, n_jobs=-1)
