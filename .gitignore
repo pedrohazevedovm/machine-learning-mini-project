@@ -7,6 +7,8 @@ __pycache__/
 *.so
 
 # Distribution / packaging
+wandb
+adult_income*
 .Python
 build/
 develop-eggs/
