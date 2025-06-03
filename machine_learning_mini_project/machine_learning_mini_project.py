@@ -5,7 +5,6 @@ import math
 
 from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.utils import shuffle
-from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import StratifiedKFold, GridSearchCV
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
@@ -19,6 +18,7 @@ from sklearn.neighbors import KNeighborsClassifier
 from scipy.stats import friedmanchisquare, rankdata
 import scikit_posthocs as sp
 from joblib import Parallel, delayed
+
 
 # === 1. IMPLEMENTAÇÃO CUSTOM LVQ ===
 class CustomLVQ(BaseEstimator, ClassifierMixin):
@@ -76,33 +76,39 @@ class CustomLVQ(BaseEstimator, ClassifierMixin):
 # === 2. PARÂMETROS PARA GRID-SEARCH ===
 param_grids = {
     "Decision Tree": {
-        "max_depth": [None, 10, 20, 30],
-        "min_samples_split": [2, 5, 10]
+        "max_depth": [5, 15, 25],
+        "min_samples_split": [2, 4, 8],
+        "criterion": ['gini', 'entropy'],
+        "splitter": ['best', 'random']
     },
     "Random Forest": {
-        "n_estimators": [50, 100, 200],
-        "max_depth": [None, 10, 20],
-        "min_samples_split": [2, 5]
+        "criterion": ['gini', 'entropy'],
+        "n_estimators": [30, 75, 150],
+        "max_depth": [5, 15, None],
+        "min_samples_split": [2, 4]
     },
     "SVM": {
-        "C": [0.1, 1, 10],
-        "kernel": ["linear", "rbf"]
+        "C": [0.5, 2, 5],
+        "kernel": ["poly", "sigmoid", "rbf"]
     },
     "MLP": {
-        "hidden_layer_sizes": [(10,), (50,)],
-        "alpha": [0.0001, 0.001],
-        "max_iter": [500, 1000]
+        "activation": ['relu', 'logistic', 'tanh'],
+        "hidden_layer_sizes": [(20,), (30,)],
+        "alpha": [0.0005, 0.005],
+        "max_iter": [750]
     },
     "KNN": {
-        "n_neighbors": [3, 5, 7],
-        "weights": ["uniform", "distance"]
+        "n_neighbors": [2, 4, 6],
+        "weights": ["uniform"],
+        "metric": ["euclidean", "manhattan"]
     },
     "LVQ": {
-        "n_prototypes_per_class": [2, 5, 10],
-        "learning_rate": [0.001, 0.01, 0.1],
-        "n_epochs": [500, 1000]
+        "n_prototypes_per_class": [3, 6],
+        "learning_rate": [0.005, 0.05],
+        "n_epochs": [750, 1250]
     }
 }
+
 
 # === 3. MÉTRICAS E FUNÇÕES AUXILIARES ===
 metrics = {
@@ -113,11 +119,13 @@ metrics = {
     "roc_auc": roc_auc_score
 }
 
+
 def compute_cd(k, N, alpha=0.05):
-    q = {2:1.960,3:2.343,4:2.569,5:2.728,6:2.850,7:2.949,8:3.031,9:3.102,10:3.164}
+    q = {2: 1.960, 3: 2.343, 4: 2.569, 5: 2.728, 6: 2.850, 7: 2.949, 8: 3.031, 9: 3.102, 10: 3.164}
     if k not in q:
         raise ValueError(f"q_alpha não definido para {k}")
     return q[k] * math.sqrt((k*(k+1)) / (6.0 * N))
+
 
 def evaluate_fold(train_idx, test_idx, models, X, y, metric, name):
     scores = []
@@ -136,12 +144,13 @@ def evaluate_fold(train_idx, test_idx, models, X, y, metric, name):
         scores.append(s)
     return scores
 
+
 def run_pipeline(X, y, models, project_name="ml-comparisons", n_splits=10, n_jobs=-1):
     model_names = list(models.keys())
     kf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
 
     for name, metric in metrics.items():
-        wandb.init(project=project_name, name=f"CD-{name}", reinit=True)
+        wandb.init(project=project_name, name=f"CD3-{name}", reinit=True)
 
         folds = Parallel(n_jobs=n_jobs)(
             delayed(evaluate_fold)(ti, vi, models, X, y, metric, name)
@@ -177,12 +186,49 @@ def run_pipeline(X, y, models, project_name="ml-comparisons", n_splits=10, n_job
         wandb.finish()
 
 
+def evaluate_on_test_and_log_wandb(best_models, X_train, y_train, X_test, y_test, project_name="ml-comparisons"):
+    """
+    Avalia os melhores modelos no conjunto de teste e loga os resultados no wandb.
+
+    Parâmetros:
+    - best_models: dict com nome → modelo treinado (idealmente vindos de GridSearchCV)
+    - X_train, y_train: dados usados para re-treinar
+    - X_test, y_test: dados de teste
+    - project_name: nome do projeto no wandb
+    """
+    wandb.init(project=project_name, name="final_test_evaluation", reinit=True)
+
+    for name, model in best_models.items():
+        # Reajusta o modelo ao treino completo
+        model.fit(X_train, y_train)
+
+        # Previsões
+        y_pred = model.predict(X_test)
+        y_proba = model.predict_proba(X_test)[:, 1] if hasattr(model, "predict_proba") else None
+
+        # Métricas
+        acc = accuracy_score(y_test, y_pred)
+        prec = precision_score(y_test, y_pred, zero_division=0)
+        rec = recall_score(y_test, y_pred)
+        f1 = f1_score(y_test, y_pred)
+        auc = roc_auc_score(y_test, y_proba) if y_proba is not None else 0.0
+
+        # Log no wandb
+        wandb.log({
+            f"{name}/test_accuracy": acc,
+            f"{name}/test_precision": prec,
+            f"{name}/test_recall": rec,
+            f"{name}/test_f1": f1,
+            f"{name}/test_roc_auc": auc,
+        })
+
+    wandb.finish()
+
+
 # === 4. MAIN ===
 if __name__ == "__main__":
-    with open(r"machine_learning_mini_project\adult_income.pkl", "rb") as f:
+    with open(r"adult_income.pkl", "rb") as f:
         X_train, y_train, X_test, y_test = pickle.load(f)
-    X = np.vstack((X_train, X_test))
-    y = np.concatenate((y_train, y_test))
 
     base_models = {
         "Decision Tree": DecisionTreeClassifier(),
@@ -203,8 +249,11 @@ if __name__ == "__main__":
             cv=StratifiedKFold(n_splits=5, shuffle=True, random_state=42),
             n_jobs=-1
         )
-        grid.fit(X, y)
+        grid.fit(X_train, y_train)
         print(f"→ {name} best_params: {grid.best_params_} (f1={grid.best_score_:.4f})")
         best_models[name] = grid.best_estimator_
 
-    run_pipeline(X, y, best_models, project_name="ml-comparisons", n_splits=10, n_jobs=-1)
+    run_pipeline(X_train, y_train, best_models, project_name="ml-comparisons", n_splits=10, n_jobs=-1)
+
+    print("Avaliação no conjunto de teste final:\n")
+    evaluate_on_test_and_log_wandb(best_models, X_train, y_train, X_test, y_test)

@@ -102,7 +102,7 @@ def run_statistical_comparison(X, y, models, project="ml-comparisons", n_splits=
     names = list(models.keys())
     kf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
     for name, metric in metrics.items():
-        wandb.init(project=project, name=f"CD-{name}", reinit=True)
+        wandb.init(project=project, name=f"CD3-{name}", reinit=True)
         folds = Parallel(n_jobs=-1)(
             delayed(evaluate_fold)(ti,vi,models,X,y,metric,name)
             for ti,vi in kf.split(X,y)
@@ -124,27 +124,24 @@ def run_statistical_comparison(X, y, models, project="ml-comparisons", n_splits=
         if p<0.05:
             post = sp.posthoc_nemenyi_friedman(F)
             post.columns = post.index = names
-            wandb.log({f"{name}/nemenyi":wandb.Table(data=post.values.tolist(), columns=names)})
+            wandb.log({f"{name}/nemenyi": wandb.Table(data=post.values.tolist(), columns=names)})
             cd = compute_cd(len(names), n_splits)
-            wandb.log({f"{name}/CD":cd})
+            wandb.log({f"{name}/CD": cd})
             wandb.log({
                 f"{name}/avg_ranks": wandb.Table(
                     data=[[names[i], float(avg_r[i])] for i in range(len(names))],
-                    columns=["Model","AvgRank"]
+                    columns=["Model", "AvgRank"]
                 )
             })
         wandb.finish()
 
+
 # === 4. MAIN ===
 if __name__ == "__main__":
-    with open(r"machine_learning_mini_project\adult_income_train_val.pkl","rb") as f:
-        X_tr, X_val, y_tr, y_val = pickle.load(f)
-    with open(r"machine_learning_mini_project\adult_income_test.pkl","rb") as f:
-        X_test, y_test = pickle.load(f)
+    with open(r"adult_income.pkl", "rb") as f:
+        X_train, y_train, X_test, y_test = pickle.load(f)
 
-    X_train_full = np.vstack((X_tr, X_val))
-    y_train_full = np.concatenate((y_tr, y_val))
-    print("Train+Val:", X_train_full.shape, y_train_full.shape)
+    print("Train+Val:", X_train.shape, y_train.shape)
     print("Test:     ", X_test.shape, y_test.shape)
 
     base_models = {
@@ -167,20 +164,20 @@ if __name__ == "__main__":
             cv=cv5,
             n_jobs=-1
         )
-        grid.fit(X_train_full, y_train_full)
-        best_models[name]  = grid.best_estimator_
-        best_scores[name]  = grid.best_score_
+        grid.fit(X_train, y_train)
+        best_models[name] = grid.best_estimator_
+        best_scores[name] = grid.best_score_
         print(f"→ {name} best_params={grid.best_params_} f1={grid.best_score_:.4f}")
 
-    run_statistical_comparison(X_train_full, y_train_full, best_models,
+    run_statistical_comparison(X_train, y_train, best_models,
                                project="ml-comparisons", n_splits=10)
 
-    best_name  = max(best_scores, key=best_scores.get)
+    best_name = max(best_scores, key=best_scores.get)
     best_model = best_models[best_name]
     print(f"\nMelhor modelo (F1 CV): {best_name}")
 
     y_pred = best_model.predict(X_test)
-    y_proba = (best_model.predict_proba(X_test)[:,1]
+    y_proba = (best_model.predict_proba(X_test)[:, 1]
                if hasattr(best_model, "predict_proba") else None)
 
     print("\n=== Avaliação no Conjunto de Teste ===")
